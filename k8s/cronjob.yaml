@@ -1,0 +1,110 @@
+# 이미지: bash/curl/jq/coreutils가 든 alpine 이미지 (스크립트는 ConfigMap으로 마운트)
+# 적용 전: image 값과 Secret 비밀번호를 바꾸세요.
+#   kubectl apply -f k8s/cronjob.yaml
+#   kubectl -n keycloak-check-user create configmap keycloak-check-user-scripts \
+#     --from-file=common.sh --from-file=keycloak.sh --from-file=keycloak-reclaim.sh \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   (스크립트 수정 시 위 configmap 명령만 다시 실행)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak-check-user
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-admin
+  namespace: keycloak-check-user
+type: Opaque
+stringData:
+  KEYCLOAK_ADMIN_USER: admin
+  KEYCLOAK_ADMIN_PASSWORD: "CHANGE_ME"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-check-user-config
+  namespace: keycloak-check-user
+data:
+  KEYCLOAK_URL: "http://aws.keycloak.com"
+  NOTIFY_API_URL: "https://security.com/api/accountmail"
+  RECLAIM_API_URL: "https://security/api/accountdel"
+  REALMS: ""              # 처리할 realm (쉼표/공백 구분, 예: "realmA,realmB"). 비우면 전체
+  EXCLUDE_REALMS: "master"
+  INACTIVE_DAYS: "90"
+  TZ: "KST-9"             # 이미지에 tzdata가 없어 Asia/Seoul은 무시됨 → POSIX 표기 사용
+  DRY_RUN: "0"            # 처음엔 "1"로 두고 로그 확인 후 "0"
+  SERVICE_ID: "CHANGE_ME"  # (필수) 자산번호. API 본문의 SERVICEID
+  # COMPANY: "회사코드"    # 비우면 realm 이름 사용
+---
+# 사전 안내: 매일 09:00 (D-10/5/3/1)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-notify
+  namespace: keycloak-check-user
+spec:
+  schedule: "0 9 * * *"
+  timeZone: "Asia/Seoul"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0          # 재시도 시 안내 메일이 중복 발송되므로 재시도 안 함
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: notify
+              image: <registry>/<기존 이미지>:<tag>
+              command: ["bash", "/scripts/keycloak.sh"]
+              envFrom:
+                - configMapRef: { name: keycloak-check-user-config }
+                - secretRef:    { name: keycloak-admin }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+          volumes:
+            - name: scripts
+              configMap: { name: keycloak-check-user-scripts }
+---
+# 회수: 매일 00:00 (D-DAY 당일·경과 사용자 accountdel 전송, Keycloak 삭제 없음)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-reclaim
+  namespace: keycloak-check-user
+spec:
+  schedule: "0 0 * * *"
+  timeZone: "Asia/Seoul"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1          # 재시도 시 대상자에게 accountdel이 다시 전송될 수 있음
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reclaim
+              image: <registry>/<기존 이미지>:<tag>
+              command: ["bash", "/scripts/keycloak-reclaim.sh"]
+              envFrom:
+                - configMapRef: { name: keycloak-check-user-config }
+                - secretRef:    { name: keycloak-admin }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+          volumes:
+            - name: scripts
+              configMap: { name: keycloak-check-user-scripts }

@@ -1,0 +1,4 @@
+*.zip
+*.orig
+*.swp
+/cronjob.yaml
